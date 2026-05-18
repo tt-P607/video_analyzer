@@ -1,0 +1,58 @@
+{
+    "name": "video_analyzer",
+    "display_name": "视频内容分析",
+    "version": "0.1.0",
+    "description": "视频分析插件，允许 LLM 主动调用多模态模型分析用户发送的视频内容，支持 B 站、抖音等平台直链解析",
+    "author": "言柒",
+    "license": "AGPL-v3.0",
+    "categories": [
+        "tool",
+        "multimodal"
+    ],
+    "tags": [
+        "video",
+        "analysis",
+        "vision",
+        "bilibili",
+        "douyin"
+    ],
+    "dependencies": {
+        "plugins": [],
+        "components": []
+    },
+    "include": [
+        {
+            "component_type": "event_handler",
+            "component_name": "video_cache_handler",
+            "description": "检测并缓存消息中的视频数据，供 analyze_video 工具使用",
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "analyze_video",
+            "description": "分析用户发送的视频内容，使用多模态模型返回视频描述",
+            "enabled": true
+        },
+        {
+            "component_type": "tool",
+            "component_name": "fetch_and_analyze_video",
+            "description": "从 B站/抖音/快手/微博/小红书/Twitter 等平台链接下载并分析视频",
+            "enabled": true
+        },
+        {
+            "component_type": "config",
+            "component_name": "config",
+            "enabled": true
+        }
+    ],
+    "entry_point": "plugin.py",
+    "min_core_version": "1.0.0",
+    "python_dependencies": [
+        "aiohttp"
+    ],
+    "dependencies_required": true,
+    "config": {
+        "config_file": "config.py",
+        "config_name": "config"
+    }
+}
