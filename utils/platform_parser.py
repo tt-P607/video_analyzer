@@ -292,7 +292,7 @@ async def _parse_bilibili(session: aiohttp.ClientSession, url: str) -> dict:
 
 
 async def _download_direct(url: str, headers: Optional[dict] = None) -> bytes:
-    """直接 HTTP 下载视频直链，返回字节内容。
+    """高性能分块并发下载器。通过 Range 请求并发下载视频直链，绕过 CDN 节点限速并拉满物理带宽。
 
     Args:
         url: 视频直链 URL
@@ -305,13 +305,63 @@ async def _download_direct(url: str, headers: Optional[dict] = None) -> bytes:
         RuntimeError: 下载失败
     """
     req_headers = headers or {"User-Agent": _MOBILE_UA, "Referer": url}
+    
+    # 1. 尝试探测文件总长度 (Content-Length)
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.head(url, headers=req_headers, allow_redirects=True) as resp:
+                if resp.status in (200, 206):
+                    content_length = int(resp.headers.get("Content-Length", 0))
+                    accept_ranges = resp.headers.get("Accept-Ranges", "").lower()
+                    support_range = "bytes" in accept_ranges or content_length > 0
+                else:
+                    content_length = 0
+                    support_range = False
+    except Exception as e:
+        logger.warning(f"获取视频 Content-Length 失败: {e}，将使用单线程标准下载")
+        content_length = 0
+        support_range = False
+
+    # 2. 如果支持分块下载，且大小足够大(> 5MB)
+    chunk_threshold = 5 * 1024 * 1024
+    if support_range and content_length > chunk_threshold:
+        concurrency = 4
+        chunk_size = content_length // concurrency
+        ranges = []
+        for i in range(concurrency):
+            start = i * chunk_size
+            end = "" if i == concurrency - 1 else str((i + 1) * chunk_size - 1)
+            ranges.append((start, end))
+
+        logger.info(f"开启 {concurrency} 线程并发分块下载，总大小: {content_length / 1024 / 1024:.1f}MB")
+
+        async def _download_chunk(idx: int, start: int, end: str) -> bytes:
+            chunk_headers = req_headers.copy()
+            chunk_headers["Range"] = f"bytes={start}-{end}"
+            
+            chunk_timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=chunk_timeout) as session:
+                async with session.get(url, headers=chunk_headers) as resp:
+                    if resp.status not in (200, 206):
+                        raise RuntimeError(f"分块 {idx} 下载失败，状态码: {resp.status}")
+                    return await resp.read()
+
+        try:
+            tasks = [_download_chunk(i, start, end) for i, (start, end) in enumerate(ranges)]
+            parts = await asyncio.gather(*tasks)
+            return b"".join(parts)
+        except Exception as e:
+            logger.warning(f"并发分块下载失败: {e}，正在为您降级为单线程标准下载...")
+
+    # 3. 降级为单线程标准下载
+    logger.info("采用单线程标准下载...")
     timeout = aiohttp.ClientTimeout(total=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, headers=req_headers) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"直接下载失败，状态码: {resp.status}")
-            data = await resp.read()
-    return data
+            return await resp.read()
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +425,6 @@ async def _ensure_mp4(data: bytes, source: str = "") -> bytes:
         RuntimeError: ffmpeg 转换失败或输入为不可转换的格式（图片）
     """
     import asyncio
-    import tempfile
     from pathlib import Path
 
     fmt = _detect_format(data)

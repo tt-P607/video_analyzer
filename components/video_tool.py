@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Annotated
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.core.components.base.tool import BaseTool
+from src.kernel.concurrency import get_task_manager
+from src.kernel.concurrency.watchdog import get_watchdog
 from src.kernel.llm import LLMPayload, Text, Video
 from src.kernel.llm.roles import ROLE
 from src.kernel.storage import json_store
@@ -76,36 +79,113 @@ class AnalyzeVideoTool(BaseTool):
         from ..config import VideoAnalyzerConfig
         config: VideoAnalyzerConfig | None = self.plugin.config  # type: ignore[assignment]
 
-        compress_threshold = config.general.compress_threshold_mb if config else 18.0
+        compress_threshold = config.general.compress_threshold_mb if config else 8.0
+        max_video_size = config.general.max_video_size_mb if config else 10.0
+        heartbeat_interval = config.general.heartbeat_interval if config else 3.0
+        compress_target = config.general.compress_target_mb if config else 8.0
         default_prompt = (
             config.general.default_analysis_prompt
             if config
             else "请详细描述这段视频的内容，包括场景、人物、动作、对话等关键信息。"
         )
 
-        # 超出阈值时尝试 ffmpeg 压缩
-        if size_mb > compress_threshold:
-            logger.info(f"视频大小 {size_mb:.1f}MB 超出阈值，尝试 ffmpeg 压缩")
+        # 提前获取安全的 stream_id (使用 BaseTool 基类的 get_current_stream_id 方法)
+        stream_id_for_heartbeat = self.get_current_stream_id()
+        if not stream_id_for_heartbeat:
+            # 兜底
+            stream_id_for_heartbeat = getattr(self, "stream_id", "")
+        stream_id_for_heartbeat = str(stream_id_for_heartbeat or "").strip()
+
+        # 启动心跳任务守护（覆盖包括压缩、多模态请求的整个 execute 执行生命周期）
+        watchdog = get_watchdog()
+        task_manager = get_task_manager()
+        heartbeat_stop = asyncio.Event()
+        heartbeat_task = None
+        
+        def refresh_napcat_heartbeat():
+            """强行刷新所有已加载 napcat 适配器的心跳计时器，避免大报文发送同步卡死时误判超时"""
             try:
-                from ..utils.video_compressor import compress_video_b64
-                b64 = await compress_video_b64(b64, target_mb=15.0)
-                logger.info("视频压缩成功")
+                from src.app.plugin_system.api.adapter_api import get_adapter
+                import time
+                adapter = get_adapter("napcat_adapter:adapter:napcat_adapter")
+                if adapter and hasattr(adapter, "meta_event_handler"):
+                    handler = getattr(adapter, "meta_event_handler")
+                    if handler:
+                        handler.last_heart_beat = time.time()
+                        logger.debug("已强行刷新 napcat_adapter 的心跳 last_heart_beat 计时")
             except Exception as e:
-                logger.warning(f"视频压缩失败，尝试直接发送: {e}")
+                logger.warning(f"刷新 napcat 适配器心跳状态失败: {e}")
 
-        prompt = default_prompt
+        async def _send_heartbeat():
+            """定期发送心跳,避免 WatchDog 超时"""
+            if not stream_id_for_heartbeat:
+                logger.warning("视频分析工具未获取到 stream_id,无法发送心跳")
+                return
+            logger.info(f"心跳任务已启动 stream_id={stream_id_for_heartbeat[:16]}, 间隔={heartbeat_interval}s")
+            while not heartbeat_stop.is_set():
+                try:
+                    await asyncio.wait_for(heartbeat_stop.wait(), timeout=heartbeat_interval)
+                    break
+                except asyncio.TimeoutError:
+                    try:
+                        watchdog.feed_dog(stream_id_for_heartbeat)
+                        refresh_napcat_heartbeat()
+                        logger.debug(f"已发送心跳并主动维持适配器连线状态 stream_id={stream_id_for_heartbeat[:16]}")
+                    except Exception as e:
+                        logger.warning(f"心跳发送或适配器维护失败: {e}")
+            logger.info(f"心跳任务已结束 stream_id={stream_id_for_heartbeat[:16]}")
+
+        if stream_id_for_heartbeat:
+            heartbeat_task = task_manager.create_task(
+                _send_heartbeat(),
+                name="video_analysis_heartbeat",
+                daemon=True,
+            )
 
         try:
-            model_set = get_model_set_by_task("video")
-        except KeyError:
-            return False, "未找到 video 任务模型，请检查 config/model.toml 中的 [model_tasks.video] 配置。"
+            # 压缩视频
+            logger.info(f"视频大小检查: size_mb={size_mb:.1f}MB, compress_threshold={compress_threshold}MB")
+            if size_mb > compress_threshold:
+                logger.info(f"视频大小 {size_mb:.1f}MB 超出阈值，尝试 ffmpeg 压缩到 {compress_target}MB")
+                try:
+                    from ..utils.video_compressor import compress_video_b64
+                    import base64
+                    b64 = await compress_video_b64(b64, target_mb=compress_target, input_size_mb=size_mb)
+                    compressed_size_mb = len(base64.b64decode(b64)) / 1024 / 1024
+                    logger.info(f"视频压缩完成: {size_mb:.1f}MB -> {compressed_size_mb:.1f}MB")
+                    size_mb = compressed_size_mb
+                except Exception as e:
+                    logger.error(f"视频压缩失败: {e}", exc_info=True)
+            else:
+                logger.info(f"视频大小 {size_mb:.1f}MB 未超出阈值 {compress_threshold}MB,跳过压缩")
 
-        request = create_llm_request(model_set, request_name="video_analysis")
-        request.add_payload(LLMPayload(ROLE.USER, [Video(b64), Text(prompt)]))
+            # 检查压缩后大小
+            if size_mb > max_video_size:
+                return False, (
+                    f"视频过大({size_mb:.1f}MB)，超过安全限制({max_video_size}MB)，"
+                    f"无法发送以避免 WebSocket 连接断开。\n"
+                    f"建议：请尝试更短的视频片段或降低视频分辨率。"
+                )
 
-        try:
-            response = await request.send(stream=False)
-            result_text: str = response.message or ""
+            prompt = default_prompt
+
+            try:
+                model_set = get_model_set_by_task("video")
+            except KeyError:
+                return False, "未找到 video 任务模型，请检查 config/model.toml 中的 [model_tasks.video] 配置。"
+
+            request = create_llm_request(model_set, request_name="video_analysis")
+            request.add_payload(LLMPayload(ROLE.USER, [Video(b64), Text(prompt)]))
+
+            # 使用流式响应接收结果,避免长时间阻塞
+            response = await request.send(stream=True)
+            result_parts: list[str] = []
+            async for chunk in response:
+                if chunk:
+                    result_parts.append(chunk)
+            
+            result_text = "".join(result_parts)
+
             # 存入描述缓存，避免重复消耗 token；同时持久化到磁盘
             if result_text:
                 analysis_cache[stream_id] = result_text
@@ -119,3 +199,11 @@ class AnalyzeVideoTool(BaseTool):
         except Exception as e:
             logger.error(f"视频分析请求失败: {e}")
             return False, f"视频分析失败：{e}"
+        finally:
+            # 停止心跳任务
+            heartbeat_stop.set()
+            if heartbeat_task and heartbeat_task.task:
+                try:
+                    await asyncio.wait_for(heartbeat_task.task, timeout=1.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass

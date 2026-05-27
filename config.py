@@ -26,8 +26,20 @@ class VideoAnalyzerConfig(BaseConfig):
             description="最大缓存条数，超出后按 LRU 顺序逐出",
         )
         compress_threshold_mb: float = Field(
-            default=18.0,
-            description="超过此大小（MB）才触发 ffmpeg 压缩，默认 18 MB",
+            default=8.0,
+            description="超过此大小（MB）才触发 ffmpeg 压缩，默认 8 MB",
+        )
+        max_video_size_mb: float = Field(
+            default=30.0,
+            description="压缩后视频的最大允许大小（MB），超过此值将拒绝发送，默认 30 MB",
+        )
+        heartbeat_interval: float = Field(
+            default=3.0,
+            description="视频分析期间心跳发送间隔（秒），默认 3 秒",
+        )
+        compress_target_mb: float = Field(
+            default=8.0,
+            description="压缩目标大小（MB），ffmpeg 会尽量压缩到此大小，默认 8 MB",
         )
         default_analysis_prompt: str = Field(
             default=(
