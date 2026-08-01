@@ -58,8 +58,8 @@ class FetchAndAnalyzeVideoTool(BaseTool):
     当你想主动看一个视频，或者用户要求你看某个链接/分享卡片里的视频时调用此工具。
     """
 
-    tool_name = "fetch_and_analyze_video"
-    tool_description = (
+    name = "fetch_and_analyze_video"
+    description = (
         "当你想主动看一个视频或图文，或者用户要求你看某个链接/分享卡片时调用此工具。"
         "支持平台：B 站（bilibili.com、b23.tv）、抖音（douyin.com、v.douyin.com）。"
         "抖音支持视频和图文（图集）两种格式，标题与简介会一并分析。"

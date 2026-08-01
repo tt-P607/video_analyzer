@@ -27,8 +27,8 @@ class VideoEventHandler(BaseEventHandler):
     使 LLM 感知到当前消息含有视频。
     """
 
-    handler_name = "video_cache_handler"
-    handler_description = "检测并缓存消息中的视频数据，供 analyze_video 工具使用"
+    name = "video_cache_handler"
+    description = "检测并缓存消息中的视频数据，供 analyze_video 工具使用"
     weight = 50
 
     init_subscribe = [EventType.ON_MESSAGE_RECEIVED]

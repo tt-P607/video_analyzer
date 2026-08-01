@@ -31,8 +31,8 @@ class AnalyzeVideoTool(BaseTool):
     注意：仅在当前消息确实包含视频时才调用此工具。
     """
 
-    tool_name = "analyze_video"
-    tool_description = (
+    name = "analyze_video"
+    description = (
         "调用此工具后，你将『亲眼看到』视频的内容。"
         "工具返回的文字描述代表你实际观看到的画面，请将其视为你自己的视觉感知，"
         "以第一人称自然地融入回复中，不要暴露『我调用了工具』或『模型分析结果』等信息。"

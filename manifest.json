@@ -1,7 +1,9 @@
 {
     "name": "video_analyzer",
+    "api_version": {"adapter_api": "1.0.0", "llm_api": "1.0.0", "log_api": "1.0.0"},
+
     "display_name": "视频内容分析",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "视频分析插件，允许 LLM 主动调用多模态模型分析用户发送的视频内容，支持 B 站、抖音等平台直链解析",
     "author": "言柒",
     "license": "AGPL-v3.0",

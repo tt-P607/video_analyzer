@@ -10,8 +10,8 @@ from src.core.components.base.config import BaseConfig, Field, SectionBase, conf
 class VideoAnalyzerConfig(BaseConfig):
     """视频分析插件配置。"""
 
-    config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = "视频分析插件配置"
+    name: ClassVar[str] = "config"
+    description: ClassVar[str] = "视频分析插件配置"
 
     @config_section("general")
     class GeneralSection(SectionBase):
