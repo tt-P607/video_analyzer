@@ -2,6 +2,7 @@
 
 支持 B 站（bilibili.com、b23.tv）和抖音（douyin.com、v.douyin.com），
 抖音同时支持视频和图文（图集）两种格式，标题与简介会一并传递给模型。
+分析结果写入框架描述缓存，已识别内容后续自动进上下文。
 """
 
 from __future__ import annotations
@@ -14,12 +15,16 @@ from typing import TYPE_CHECKING, Annotated
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
+from src.app.plugin_system.api.media_api import (
+    get_media_info,
+    save_description_cache,
+    save_media_info,
+)
 from src.core.components.base.tool import BaseTool
 from src.kernel.concurrency import get_task_manager
 from src.kernel.concurrency.watchdog import get_watchdog
 from src.kernel.llm import LLMPayload, Text, Video
 from src.kernel.llm.roles import ROLE
-from src.kernel.storage import json_store
 
 if TYPE_CHECKING:
     from ..plugin import VideoAnalyzerPlugin
@@ -48,7 +53,6 @@ def _extract_url(text: str) -> str:
         url = match.group(0).rstrip(".,;:!?")
         return url
     return text
-
 
 
 class FetchAndAnalyzeVideoTool(BaseTool):
@@ -93,13 +97,11 @@ class FetchAndAnalyzeVideoTool(BaseTool):
         from ..utils.platform_parser import fetch_video_bytes, FetchResult
         from src.kernel.llm import Image
 
-        analysis_cache: dict = self.plugin.analysis_cache  # type: ignore[attr-defined]
-
         # 提前读取配置（用于心跳间隔）
         from ..config import VideoAnalyzerConfig
         config: VideoAnalyzerConfig | None = self.plugin.config  # type: ignore[assignment]
         heartbeat_interval = config.general.heartbeat_interval if config else 3.0
-        
+
         # 提前获取安全的 stream_id (使用 BaseTool 基类的 get_current_stream_id 方法)
         stream_id_for_heartbeat = self.get_current_stream_id()
         if not stream_id_for_heartbeat:
@@ -112,7 +114,7 @@ class FetchAndAnalyzeVideoTool(BaseTool):
         task_manager = get_task_manager()
         heartbeat_stop = asyncio.Event()
         heartbeat_task = None
-        
+
         def refresh_napcat_heartbeat():
             """强行刷新所有已加载 napcat 适配器的心跳计时器，避免大报文发送同步卡死时误判超时"""
             try:
@@ -165,7 +167,7 @@ class FetchAndAnalyzeVideoTool(BaseTool):
                 logger.error(f"视频/图文下载失败: {e}")
                 return False, f"内容下载失败，可能是链接无效、平台不支持或网络超时：{e}"
 
-            # 构建缓存 key（按媒体内容哈希）
+            # 构建缓存 key（按媒体内容哈希，与框架 video_id 一致）
             if result.is_gallery:
                 cache_source = b"".join(result.image_bytes_list)
                 media_desc = f"图文 {len(result.image_bytes_list)} 张图片"
@@ -177,13 +179,15 @@ class FetchAndAnalyzeVideoTool(BaseTool):
             logger.info(f"内容下载完成（{result.platform}），{media_desc}")
 
             cache_key = hashlib.md5(cache_source, usedforsecurity=False).hexdigest()
-            logger.info(f"计算缓存 key={cache_key[:16]}, 当前缓存 keys={list(analysis_cache.keys())[:5]}")
+            logger.info(f"计算缓存 key={cache_key[:16]}")
 
-            if cache_key in analysis_cache:
+            # 已分析过：直接返回缓存描述（框架描述缓存，key 为内容哈希）
+            existing = await get_media_info(cache_key)
+            if existing and existing.get("description"):
                 logger.info(f"命中描述缓存 cache_key={cache_key[:16]}")
-                cached = analysis_cache[cache_key]
+                cached = existing["description"]
                 return True, f"[这段内容你之前已经看过，以下是你当时的印象]\n{cached}"
-            
+
             logger.info(f"未命中缓存,继续处理视频 cache_key={cache_key[:16]}")
 
             if result.is_gallery:
@@ -232,7 +236,7 @@ class FetchAndAnalyzeVideoTool(BaseTool):
                 # 视频：压缩后用 Video payload
                 b64 = base64.b64encode(result.video_bytes or b"").decode()
                 video_size_mb = len(result.video_bytes or b"") / 1024 / 1024
-                
+
                 # 压缩视频
                 if video_size_mb > compress_threshold:
                     logger.info(f"视频大小 {video_size_mb:.1f}MB 超出阈值，尝试 ffmpeg 压缩到 {compress_target}MB")
@@ -244,7 +248,7 @@ class FetchAndAnalyzeVideoTool(BaseTool):
                         video_size_mb = compressed_size_mb
                     except Exception as e:
                         logger.warning(f"视频压缩失败: {e}")
-                
+
                 # 检查压缩后大小
                 if video_size_mb > max_video_size:
                     return False, (
@@ -252,18 +256,18 @@ class FetchAndAnalyzeVideoTool(BaseTool):
                         f"无法发送以避免 WebSocket 连接断开。\n"
                         f"建议：请尝试更短的视频片段或降低视频分辨率。"
                     )
-                
+
                 request.add_payload(LLMPayload(ROLE.USER, [Video(b64), Text(full_prompt)]))
 
             logger.info(f"fetch_and_analyze_video 开始分析 cache_key={cache_key[:16]}")
-            
+
             # 使用流式响应接收结果,避免长时间阻塞
             response = await request.send(stream=True)
             analysis_parts: list[str] = []
             async for chunk in response:
                 if chunk:
                     analysis_parts.append(chunk)
-            
+
             analysis = "".join(analysis_parts)
 
             # 组装最终结果：标题/简介 + 分析内容
@@ -279,14 +283,17 @@ class FetchAndAnalyzeVideoTool(BaseTool):
             result_text = "\n".join(output_parts)
 
             if result_text:
-                analysis_cache[cache_key] = result_text
-                try:
-                    from ..plugin import _ANALYSIS_CACHE_KEY
-                    await json_store.save(_ANALYSIS_CACHE_KEY, dict(analysis_cache))
-                except Exception as e:
-                    logger.warning(f"分析缓存持久化失败: {e}")
+                # 写入框架描述缓存（converter 命中后描述自动进上下文）
+                # 并同步更新 Videos 业务表，供 get_media_info 判定已识别
+                await save_description_cache(cache_key, "video", result_text)
+                await save_media_info(
+                    cache_key,
+                    "video",
+                    description=result_text,
+                    vlm_processed=True,
+                )
                 preview = result_text[:120].replace("\n", " ")
-                logger.info(f"分析完成 cache_key={cache_key[:16]}，预览: {preview}...")
+                logger.info(f"分析完成并写入框架缓存 cache_key={cache_key[:16]}，预览: {preview}...")
             else:
                 logger.warning(f"分析返回空结果 cache_key={cache_key[:16]}")
 

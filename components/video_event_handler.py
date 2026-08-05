@@ -1,7 +1,8 @@
 """视频事件处理器。
 
-订阅 ON_MESSAGE_RECEIVED 事件，检测消息中的视频段，
-将视频数据缓存到插件实例，并向 LLM 注入视频存在提示。
+订阅 ON_MESSAGE_RECEIVED 事件，检测消息中的视频段，将视频元数据
+（video_id 等）缓存到插件实例，供 analyze_video 工具按 video_id 查询。
+视频二进制由框架媒体管理器落盘入库，不在此重复存储。
 """
 
 from __future__ import annotations
@@ -20,11 +21,11 @@ logger = get_logger("video_analyzer")
 
 
 class VideoEventHandler(BaseEventHandler):
-    """检测并缓存消息中的视频数据，供 analyze_video 工具使用。
+    """检测并缓存消息中的视频元数据，供 analyze_video 工具使用。
 
-    当消息的 unknown_segments 中包含 type="video" 的段时，
-    将视频 base64 数据存入插件缓存，并在消息内容末尾注入提示文本，
-    使 LLM 感知到当前消息含有视频。
+    视频段由 converter 解析后存放于 ``message.extra["media"]``（带 video_id），
+    本处理器读取该字段并将视频元数据（video_id、filename、size_mb、url）
+    存入插件缓存，供 analyze_video 工具按 video_id 查询。
     """
 
     name = "video_cache_handler"
@@ -45,7 +46,7 @@ class VideoEventHandler(BaseEventHandler):
     async def execute(
         self, event_name: str, params: dict[str, Any]
     ) -> tuple[EventDecision, dict[str, Any]]:
-        """处理消息事件，提取并缓存视频数据。
+        """处理消息事件，提取并缓存视频元数据。
 
         Args:
             event_name: 事件名称
@@ -58,60 +59,29 @@ class VideoEventHandler(BaseEventHandler):
         if message is None:
             return EventDecision.PASS, params
 
-        unknown_segs: list[dict[str, Any]] = message.extra.get("unknown_segments") or []
-        video_segs = [s for s in unknown_segs if s.get("type") == "video"]
+        # 视频段由 converter 存入 message.extra["media"]（带 video_id）
+        media_list: list[dict[str, Any]] = message.extra.get("media") or []
+        video_segs = [m for m in media_list if m.get("type") == "video"]
         if not video_segs:
             return EventDecision.PASS, params
 
-        video_data: dict[str, Any] = video_segs[0].get("data") or {}
-        b64: str = video_data.get("base64", "")
-        if not b64:
+        video: dict[str, Any] = video_segs[0]
+        video_id: str = video.get("video_id", "")
+        if not video_id:
             return EventDecision.PASS, params
 
-        stream_id: str = getattr(message, "stream_id", "")
-        if not stream_id:
-            return EventDecision.PASS, params
-
-        # 用视频内容的 MD5 哈希作为缓存 key，同一视频无论谁发/引用/转发都命中同一 key
-        import hashlib
-        cache_key = hashlib.md5(b64.encode(), usedforsecurity=False).hexdigest()
-
-        # 存入插件级缓存（LRU 逐出超出上限的最旧条目）
-        cache: dict = self.plugin.video_cache  # type: ignore[attr-defined]
-        from ..config import VideoAnalyzerConfig
-        config: VideoAnalyzerConfig | None = self.plugin.config  # type: ignore[assignment]
-        max_entries = config.general.max_cache_entries if config else 50
-
-        if cache_key not in cache and len(cache) >= max_entries:
-            # 逐出最早插入的条目
-            oldest_key = next(iter(cache))
-            del cache[oldest_key]
-            logger.info(f"视频缓存已满，逐出最旧条目: {oldest_key[:8]}")
-
-        cache[cache_key] = {
-            "base64": b64,
-            "filename": video_data.get("filename", "video.mp4"),
-            "size_mb": video_data.get("size_mb", 0.0),
+        # 缓存视频元数据（二进制由框架落盘，工具经 media_api.get_media_file 读取）
+        cache: dict[str, dict] = self.plugin.video_cache  # type: ignore[attr-defined]
+        cache[video_id] = {
+            "video_id": video_id,
+            "filename": video.get("filename", "video.mp4"),
+            "size_mb": video.get("size_mb", 0.0),
+            "url": video.get("url", ""),
         }
         logger.info(
-            f"视频已缓存 key={cache_key[:8]} "
-            f"filename={video_data.get('filename', 'video.mp4')} "
-            f"size={video_data.get('size_mb', 0):.1f}MB"
+            f"视频已缓存 video_id={video_id[:8]} "
+            f"filename={video.get('filename', 'video.mp4')} "
+            f"size={video.get('size_mb', 0):.1f}MB"
         )
-
-        # 向消息内容注入提示，让 LLM 感知视频存在（用内容哈希 key 查找）
-        hint = (
-            f"\n[系统提示：当前消息包含一段视频（video_id: {cache_key}），"
-            f"如需分析视频内容，请调用 analyze_video 工具，传入该 video_id]"
-        )
-        content = getattr(message, "content", "")
-        if isinstance(content, str):
-            message.content = content + hint
-        elif isinstance(content, list):
-            message.content = message.content + [hint]
-
-        # format_message_line 优先使用 processed_plain_text，必须同步更新
-        plain = getattr(message, "processed_plain_text", None) or ""
-        message.processed_plain_text = plain + hint
 
         return EventDecision.SUCCESS, params
