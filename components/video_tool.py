@@ -7,12 +7,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.app.plugin_system.api.media_api import (
-    get_media_file,
     get_media_info,
     save_description_cache,
     save_media_info,
@@ -44,6 +45,9 @@ class AnalyzeVideoTool(BaseTool):
         "工具返回的文字描述代表你实际观看到的画面，请将其视为你自己的视觉感知，"
         "以第一人称自然地融入回复中，不要暴露『我调用了工具』或『模型分析结果』等信息。"
         "仅在系统提示中明确标注当前消息含有视频（video_id 已提供）时才调用此工具。"
+        "注意：如果消息文本中该视频占位符已经直接带有描述文本"
+        "（形如 [视频(video_id):描述]），说明这段视频你以前已经看过、内容已知，"
+        "请直接基于那段描述回复，不要重复调用本工具。"
     )
 
     def __init__(self, plugin: "VideoAnalyzerPlugin") -> None:
@@ -73,8 +77,20 @@ class AnalyzeVideoTool(BaseTool):
             logger.info(f"analyze_video 命中描述缓存，video_id={video_id[:16]}")
             return True, f"[这段视频你之前已经看过，以下是你当时的印象]\n{info['description']}"
 
-        # 从框架媒体管理器读取落盘的视频文件（base64）
-        b64 = await get_media_file(video_id)
+        # 从落盘路径读取视频文件（base64）。
+        # get_media_info 已做 Images/Voices/Videos 三表回退，可拿到视频记录的 path；
+        # 不依赖 get_media_file（其仅查 Images 表，读不到 Videos 表视频）。
+        b64 = None
+        if info and info.get("path"):
+            media_path = Path(info["path"])
+            try:
+                if not media_path.is_absolute():
+                    media_path = Path(".") / media_path
+                if media_path.exists():
+                    data = await asyncio.to_thread(media_path.read_bytes)
+                    b64 = base64.b64encode(data).decode("ascii")
+            except Exception as e:
+                logger.warning(f"读取视频文件失败: {media_path}: {e}")
         if not b64:
             logger.info(f"analyze_video 未找到视频文件，video_id={video_id!r}")
             return False, "未找到对应的视频数据，视频可能已过期或尚未收到。"
@@ -153,7 +169,6 @@ class AnalyzeVideoTool(BaseTool):
                 logger.info(f"视频大小 {size_mb:.1f}MB 超出阈值，尝试 ffmpeg 压缩到 {compress_target}MB")
                 try:
                     from ..utils.video_compressor import compress_video_b64
-                    import base64
                     b64 = await compress_video_b64(b64, target_mb=compress_target, input_size_mb=size_mb)
                     compressed_size_mb = len(base64.b64decode(b64)) / 1024 / 1024
                     logger.info(f"视频压缩完成: {size_mb:.1f}MB -> {compressed_size_mb:.1f}MB")
