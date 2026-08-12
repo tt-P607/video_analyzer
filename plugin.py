@@ -29,7 +29,6 @@ class VideoAnalyzerPlugin(BasePlugin):
     """
 
     plugin_name = "video_analyzer"
-    plugin_description = "允许 LLM 主动调用多模态模型分析用户发送的视频，返回视频内容摘要"
 
     configs: list[type] = [VideoAnalyzerConfig]
     dependent_components: list[str] = []
